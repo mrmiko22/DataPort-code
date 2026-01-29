@@ -17,64 +17,52 @@ def log(msg):
 # Core Logic of Data Preprocessing
 # ==============================================
 def preprocess_dataframe(df):
-    log("Begin preprocessing this file")
+    log("Commencing pre-processing of power system data")
 
+    # 1. Foundation clearance
     df = df.replace([" ", "", "NULL", "null", "None"], np.nan)
 
+    date_col = df.columns[0]
+    data_cols = df.columns[1:]
 
-    for col in df.columns:
-
-        try:
-            df[col] = pd.to_numeric(df[col])
-        except (ValueError, TypeError):
-            continue
-
-    temp = df.replace(0, np.nan)
+    df[data_cols] = df[data_cols].apply(pd.to_numeric, errors='coerce').replace(0, np.nan)
 
     # ---------------------------
-    # 3) Delete rows with missing values exceeding x%
+    # 1) Remove rows with significant data loss
     # ---------------------------
-    log("Detect rows where 0 or NaN values exceed x% of the entire row.")
-
-    missing_ratio = temp.isna().mean(axis=1)
+    missing_ratio = df[data_cols].isna().mean(axis=1)
     df = df.loc[missing_ratio <= x].copy()  #Here, x requires the user to modify a value within the range [0, 1].
 
-    df = df.replace(0, np.nan)
+    if df.empty:
+        log("Warning: All lines in this file have a missing rate exceeding x per cent; skipping.")
+        return df
 
     # ---------------------------
-    # 4) Interpolation + Completion Logic
+    # 2) Longitudinal filling
     # ---------------------------
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-
-    if len(numeric_cols) > 0:
-        log(f"Processing {len(numeric_cols)} numeric columns for interpolation...")
-
-        df[numeric_cols] = df[numeric_cols].interpolate(method="linear", limit_direction="both")
-
-        log("Perform forward padding + backward padding")
-        df[numeric_cols] = df[numeric_cols].ffill().bfill()
-
-        for col in numeric_cols:
-            if df[col].isna().any():
-                median_val = df[col].median()
-                if pd.notna(median_val):
-                    df[col] = df[col].fillna(median_val)
-                    log(f"Column {col} imputed with median: {median_val}")
-                else:
-                    df[col] = df[col].fillna(0)
+    log("执行纵向均值填充（基于时刻特征）")
+    df[data_cols] = df[data_cols].fillna(df[data_cols].mean())
 
     # ---------------------------
-    # 5) Type inference & Formatting
+    # 3) Horizontal interpolation
     # ---------------------------
-    df = df.infer_objects(copy=False)
+    log("Perform horizontal linear interpolation")
+    df[data_cols] = df[data_cols].interpolate(method="linear", axis=1, limit_direction="both")
 
-    if len(numeric_cols) > 0:
-        log("All values are formatted as floats and rounded to 4 decimal places.")
+    # ---------------------------
+    # 4) Ultimately, the safety net
+    # ---------------------------
+    if df[data_cols].isna().any().any():
+        log("Perform global default filling")
+        global_mean = df[data_cols].stack().mean()
+        df[data_cols] = df[data_cols].fillna(global_mean)
 
-        df[numeric_cols] = df[numeric_cols].apply(lambda x: x.astype(float).round(4))
+    # ---------------------------
+    # 5) Formatting
+    # ---------------------------
+    df[data_cols] = df[data_cols].astype(float).round(4)
 
     return df
-
 
 # ==============================================
 # Processing a single CSV file
