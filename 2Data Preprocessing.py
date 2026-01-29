@@ -17,89 +17,81 @@ def log(msg):
 # Core Logic of Data Preprocessing
 # ==============================================
 def preprocess_dataframe(df):
-    log("Commencing pre-processing of power system data")
+    log("Commencing preprocessing of this file")
 
-    # 1. Foundation clearance
     df = df.replace([" ", "", "NULL", "null", "None"], np.nan)
 
-    date_col = df.columns[0]
-    data_cols = df.columns[1:]
-
-    df[data_cols] = df[data_cols].apply(pd.to_numeric, errors='coerce').replace(0, np.nan)
+    temp = df.replace(0, np.nan)
 
     # ---------------------------
-    # 1) Remove rows with significant data loss
+    # 1) Remove rows where the proportion of missing values exceeds x
     # ---------------------------
-    missing_ratio = df[data_cols].isna().mean(axis=1)
-    df = df.loc[missing_ratio <= x].copy()  #Here, x requires the user to modify a value within the range [0, 1].
+    log("Detect rows where the number of 0s or NaNs exceeds x")
+    missing_ratio = temp.isna().mean(axis=1)
+    df = df.loc[missing_ratio <= x].copy() #Here, x requires the user to modify a value within the range [0, 1].
 
-    if df.empty:
-        log("Warning: All lines in this file have a missing rate exceeding x per cent; skipping.")
-        return df
-
-    # ---------------------------
-    # 2) Longitudinal filling
-    # ---------------------------
-    log("执行纵向均值填充（基于时刻特征）")
-    df[data_cols] = df[data_cols].fillna(df[data_cols].mean())
+    df = df.replace(0, np.nan)
 
     # ---------------------------
-    # 3) Horizontal interpolation
+    # 2) Interpolation + Completion Logic
     # ---------------------------
-    log("Perform horizontal linear interpolation")
-    df[data_cols] = df[data_cols].interpolate(method="linear", axis=1, limit_direction="both")
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+
+    if len(numeric_cols) > 0:
+        log("Implementing a multi-level backfilling strategy...")
+
+        log("1. Perform lateral PCHIP conformal interpolation")
+        df[numeric_cols] = df[numeric_cols].interpolate(method='pchip', axis=1, limit_direction='both')
+
+        log("2. Perform vertical linear interpolation")
+        df[numeric_cols] = df[numeric_cols].interpolate(method='linear', axis=0, limit_direction='both')
+
+        log("3. Perform full-range boundary filling")
+        df[numeric_cols] = df[numeric_cols].ffill(axis=1).bfill(axis=1)
+        df[numeric_cols] = df[numeric_cols].ffill(axis=0).bfill(axis=0)
+
+        if df[numeric_cols].isna().any().any():
+            log("Detected persistent missing values; imputed using the global median.")
+            for col in numeric_cols:
+                if df[col].isna().any():
+                    median_val = df[col].median()
+                    fill_val = 0 if pd.isna(median_val) else median_val
+                    df[col] = df[col].fillna(fill_val)
 
     # ---------------------------
-    # 4) Ultimately, the safety net
+    # 3) Type inference avoids FutureWarning
     # ---------------------------
-    if df[data_cols].isna().any().any():
-        log("Perform global default filling")
-        global_mean = df[data_cols].stack().mean()
-        df[data_cols] = df[data_cols].fillna(global_mean)
+    df = df.infer_objects(copy=False)
 
     # ---------------------------
-    # 5) Formatting
+    # 4) Final format: All values retained to 4 decimal places
     # ---------------------------
-    df[data_cols] = df[data_cols].astype(float).round(4)
+    if len(numeric_cols) > 0:
+        log("All values are formatted as floats, retaining four decimal places.")
+        df[numeric_cols] = df[numeric_cols].astype(float).round(4)
 
     return df
+
 
 # ==============================================
 # Processing a single CSV file
 # ==============================================
 def process_single_file(in_path, out_path):
-    log(f"Reading CSV: {in_path}")
-    try:
+    log(f"Read CSV：{in_path}")
+    df = pd.read_csv(in_path, encoding="utf-8", low_memory=False)
 
-        df = pd.read_csv(in_path, encoding="utf-8", low_memory=False, dtype=str)
+    df = preprocess_dataframe(df)
 
-        if df.empty:
-            log(f"Skipping empty file: {in_path}")
-            return
-
-        df = preprocess_dataframe(df)
-
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        log(f"Write CSV: {out_path}")
-        df.to_csv(out_path, index=False, encoding="utf-8-sig")
-
-    except Exception as e:
-        log(f"Error reading/processing {in_path}: {e}")
-        raise e
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    log(f"Write CSV：{out_path}")
+    df.to_csv(out_path, index=False, encoding="utf-8-sig")
 
 
 # ==============================================
-# Main Process: Maintain Directory Structure
+# Main
 # ==============================================
 def process_all_files(input_root, output_root):
     log("Begin batch processing all files")
-
-    if not os.path.exists(input_root):
-        log(f"Input folder not found: {input_root}")
-        return
-
-    success_count = 0
-    fail_count = 0
 
     for dirpath, dirnames, filenames in os.walk(input_root):
         for filename in filenames:
@@ -113,17 +105,14 @@ def process_all_files(input_root, output_root):
             out_path = os.path.join(out_dir, filename)
 
             log("=" * 80)
-            log(f"Processing: {filename}")
+            log(f"Commencing processing of the document：{filename}")
             try:
                 process_single_file(in_path, out_path)
-                log(f"Success: {filename}")
-                success_count += 1
+                log(f"File processing successful：{filename}")
             except Exception as e:
-                log(f"Failed: {filename} -> {e}")
-                fail_count += 1
+                log(f"An error occurred while processing the file {filename}:{e}")
 
-    log("=" * 80)
-    log(f"All files processed. Success: {success_count}, Failed: {fail_count}")
+    log("All documents have been processed.")
 
 
 # ==============================================
