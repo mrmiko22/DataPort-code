@@ -1,175 +1,236 @@
 import os
-import pandas as pd
-import numpy as np
 import warnings
 
-warnings.filterwarnings('ignore')
+import numpy as np
+import pandas as pd
 
-# ==================== Deployment Zone ====================
-input_root = r"3Data Filtering"
-output_root = r"4Data desensitization"
-
-os.makedirs(output_root, exist_ok=True)
-
-DATE_COL = "Date"
-VALUE_COLS = [f"Value_{i+1}" for i in range(96)]
-
-# === Classification of noise intensity (based on physical characteristics) ===
-NOISE_CURRENT_FACTOR = x  #Here, x requires the user to modify a value.
-NOISE_VOLTAGE_FACTOR = y  #Here, y requires the user to modify a value.
-NOISE_POWER_FACTOR = z  #Here, z requires the user to modify a value.
-
-# === Listing mode ===
-CURRENT_KEYS = ['XDL']
-VOLTAGE_KEYS = ['XDY']
-POWER_KEYS = ['GGL']
-# ===============================================
+warnings.filterwarnings("ignore")
 
 
-def classify_column(col_name: str):
-    if any(k in col_name.upper() for k in CURRENT_KEYS):
+INPUT_ROOT = r"3Data Filtering"
+OUTPUT_ROOT = r"4Data desensitization"
+
+VALUE_COLS = [f"Value_{i + 1}" for i in range(96)]
+
+CURRENT_KEYS = ["XDL"]
+VOLTAGE_KEYS = ["XDY"]
+POWER_KEYS = ["GGL"]
+
+ACTIVE_TOTAL_KEY = "YGGL"
+ACTIVE_PHASE_KEYS = ["AXYGGL", "BXYGGL", "CXYGGL"]
+REACTIVE_TOTAL_KEY = "WGGL"
+REACTIVE_PHASE_KEYS = ["AXWGGL", "BXWGGL", "CXWGGL"]
+
+
+def require_private_float(env_name):
+    value = os.getenv(env_name)
+    if value is None:
+        raise RuntimeError(
+            f"Private configuration {env_name} is required. "
+            "Set it outside the public repository before running this script."
+        )
+    return float(value)
+
+
+def load_private_config():
+    return {
+        "noise_current_factor": require_private_float("TYMPSSMD_NOISE_CURRENT_FACTOR"),
+        "noise_voltage_factor": require_private_float("TYMPSSMD_NOISE_VOLTAGE_FACTOR"),
+        "noise_power_factor": require_private_float("TYMPSSMD_NOISE_POWER_FACTOR"),
+        "active_consistency_threshold": require_private_float(
+            "TYMPSSMD_ACTIVE_CONSISTENCY_THRESHOLD"
+        ),
+        "reactive_consistency_threshold": require_private_float(
+            "TYMPSSMD_REACTIVE_CONSISTENCY_THRESHOLD"
+        ),
+        "bounded_correction_fraction": require_private_float(
+            "TYMPSSMD_BOUNDED_CORRECTION_FRACTION"
+        ),
+    }
+
+
+def classify_column(file_name):
+    upper_name = file_name.upper()
+    if any(key in upper_name for key in CURRENT_KEYS):
         return "current"
-    if any(k in col_name.upper() for k in VOLTAGE_KEYS):
+    if any(key in upper_name for key in VOLTAGE_KEYS):
         return "voltage"
-    if any(k in col_name.upper() for k in POWER_KEYS):
+    if any(key in upper_name for key in POWER_KEYS):
         return "power"
     return "unknown"
 
 
-# ==================== Global Metrics Collection ====================
 def collect_global_stats(input_root):
-    print("========== Phase 1: Collection of Global Statistics ==========")
-
     current_vals = []
     voltage_vals = []
     power_vals = []
 
-    for line in os.listdir(input_root):
-        p1 = os.path.join(input_root, line)
-        if not os.path.isdir(p1):
+    for feeder in os.listdir(input_root):
+        feeder_path = os.path.join(input_root, feeder)
+        if not os.path.isdir(feeder_path):
             continue
-        print(f"[Level 1 Directory] {line}")
 
-        for byq in os.listdir(p1):
-            p2 = os.path.join(p1, byq)
-            if not os.path.isdir(p2):
+        for transformer in os.listdir(feeder_path):
+            transformer_path = os.path.join(feeder_path, transformer)
+            if not os.path.isdir(transformer_path):
                 continue
-            print(f"  [Secondary directory] {byq}")
 
-            for file in os.listdir(p2):
-                if not file.endswith(".csv"):
+            for file_name in os.listdir(transformer_path):
+                if not file_name.endswith(".csv"):
                     continue
-                print(f"    [Read the file] {file}（Statistical phase）")
 
-                df = pd.read_csv(os.path.join(p2, file), encoding="utf-8-sig")
+                path = os.path.join(transformer_path, file_name)
+                df = pd.read_csv(path, encoding="utf-8-sig")
                 vals = df[VALUE_COLS].replace("", np.nan).astype(float)
+                flattened = vals.stack().dropna().values
 
-                ctype = classify_column(file)
-                if ctype == "current":
-                    current_vals.append(vals.stack().dropna().values)
-                elif ctype == "voltage":
-                    voltage_vals.append(vals.stack().dropna().values)
-                elif ctype == "power":
-                    power_vals.append(vals.stack().dropna().values)
+                file_type = classify_column(file_name)
+                if file_type == "current":
+                    current_vals.append(flattened)
+                elif file_type == "voltage":
+                    voltage_vals.append(flattened)
+                elif file_type == "power":
+                    power_vals.append(flattened)
 
-    def calc_std(x):
-        return np.std(np.concatenate(x)) if x else 1.0
-
-    print("Global statistics collection completed。")
+    def calc_std(parts):
+        if not parts:
+            return 1.0
+        return float(np.std(np.concatenate(parts)))
 
     return calc_std(current_vals), calc_std(voltage_vals), calc_std(power_vals)
 
 
-# ========== Calculate the global standard deviation for three categories ==========
-STD_CURRENT, STD_VOLTAGE, STD_POWER = collect_global_stats(input_root)
-
-SIGMA_CURRENT = STD_CURRENT * NOISE_CURRENT_FACTOR
-SIGMA_VOLTAGE = STD_VOLTAGE * NOISE_VOLTAGE_FACTOR
-SIGMA_POWER = STD_POWER * NOISE_POWER_FACTOR
-
-print("\nCalculate the standard deviation of the noise：")
-print(f"  Current noise σ = {SIGMA_CURRENT:.6f}")
-print(f"  voltage noise σ = {SIGMA_VOLTAGE:.6f}")
-print(f"  Power noise σ = {SIGMA_POWER:.6f}\n")
-
-
-# ==================== Noise addition function ====================
-def apply_noise(df, file_type):
+def apply_noise(df, file_type, sigmas, rng):
     vals = df[VALUE_COLS].astype(float)
+    sigma_current, sigma_voltage, sigma_power = sigmas
 
     if file_type == "current":
-        noise = np.random.normal(0, SIGMA_CURRENT, vals.shape)
+        noise = rng.normal(0, sigma_current, vals.shape)
         new_vals = np.maximum(vals + noise, 0)
-
     elif file_type == "voltage":
-        noise = np.random.normal(0, SIGMA_VOLTAGE, vals.shape)
+        noise = rng.normal(0, sigma_voltage, vals.shape)
         new_vals = vals + noise
-
     elif file_type == "power":
-        noise = np.random.normal(0, SIGMA_POWER, vals.shape)
+        noise = rng.normal(0, sigma_power, vals.shape)
         new_vals = vals * (1 + noise)
-
     else:
-        noise = np.random.normal(0, STD_VOLTAGE * 0.01, vals.shape)
+        noise = rng.normal(0, sigma_voltage, vals.shape)
         new_vals = vals + noise
 
     df[VALUE_COLS] = np.round(new_vals, 4)
     return df
 
 
-# ==================== Calculate the total number of files ====================
-print("Counting the number of files awaiting processing...")
+def find_file(data_map, key):
+    key = key.upper()
+    for file_name, df in data_map.items():
+        base_name = os.path.splitext(file_name)[0].upper()
+        if base_name == key:
+            return file_name, df
+    return None, None
 
-total_files = 0
-for a in os.listdir(input_root):
-    p1 = os.path.join(input_root, a)
-    if not os.path.isdir(p1):
-        continue
-    for b in os.listdir(p1):
-        p2 = os.path.join(p1, b)
-        if not os.path.isdir(p2):
+
+def bounded_consistency_correction(total_df, phase_dfs, threshold, correction_fraction):
+    total = total_df[VALUE_COLS].astype(float)
+    phases = [df[VALUE_COLS].astype(float) for df in phase_dfs]
+    phase_sum = phases[0] + phases[1] + phases[2]
+    residual = total - phase_sum
+
+    correction = residual / 3.0
+    phase_scale = phase_sum.abs() / 3.0
+    bound = (phase_scale * correction_fraction).replace(0, np.nan)
+    correction_array = correction.to_numpy(dtype=float)
+    bound_array = bound.to_numpy(dtype=float)
+    clipped_array = np.where(
+        np.isnan(bound_array),
+        0.0,
+        np.minimum(np.maximum(correction_array, -bound_array), bound_array),
+    )
+    clipped = pd.DataFrame(clipped_array, index=correction.index, columns=correction.columns)
+
+    needs_correction = residual.abs() > threshold
+    for phase_df in phase_dfs:
+        values = phase_df[VALUE_COLS].astype(float)
+        values = values.where(~needs_correction, values + clipped)
+        phase_df[VALUE_COLS] = np.round(values, 4)
+
+
+def apply_physical_consistency_checks(data_map, config):
+    _, active_total = find_file(data_map, ACTIVE_TOTAL_KEY)
+    active_phase_dfs = [find_file(data_map, key)[1] for key in ACTIVE_PHASE_KEYS]
+
+    if active_total is not None and all(df is not None for df in active_phase_dfs):
+        bounded_consistency_correction(
+            active_total,
+            active_phase_dfs,
+            config["active_consistency_threshold"],
+            config["bounded_correction_fraction"],
+        )
+
+    _, reactive_total = find_file(data_map, REACTIVE_TOTAL_KEY)
+    reactive_phase_dfs = [find_file(data_map, key)[1] for key in REACTIVE_PHASE_KEYS]
+
+    if reactive_total is not None and all(df is not None for df in reactive_phase_dfs):
+        bounded_consistency_correction(
+            reactive_total,
+            reactive_phase_dfs,
+            config["reactive_consistency_threshold"],
+            config["bounded_correction_fraction"],
+        )
+
+
+def process_transformer_folder(input_path, output_path, sigmas, config, rng):
+    os.makedirs(output_path, exist_ok=True)
+    data_map = {}
+
+    for file_name in os.listdir(input_path):
+        if not file_name.endswith(".csv"):
             continue
-        for f in os.listdir(p2):
-            if f.endswith(".csv"):
-                total_files += 1
+        file_type = classify_column(file_name)
+        df = pd.read_csv(os.path.join(input_path, file_name), encoding="utf-8-sig")
+        data_map[file_name] = apply_noise(df, file_type, sigmas, rng)
 
-print(f"A total of {total_files} files need to be processed.\n")
+    apply_physical_consistency_checks(data_map, config)
+
+    for file_name, df in data_map.items():
+        df.to_csv(
+            os.path.join(output_path, file_name),
+            index=False,
+            encoding="utf-8-sig",
+        )
 
 
-# ==================== Batch data de-identification ====================
-print("========== Stage 2: Commencing Batch Data De-identification ==========")
+def main():
+    config = load_private_config()
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
-processed = 0
+    std_current, std_voltage, std_power = collect_global_stats(INPUT_ROOT)
+    sigmas = (
+        std_current * config["noise_current_factor"],
+        std_voltage * config["noise_voltage_factor"],
+        std_power * config["noise_power_factor"],
+    )
 
-for line in os.listdir(input_root):
-    p1 = os.path.join(input_root, line)
-    if not os.path.isdir(p1):
-        continue
-    print(f"[Level 1 Directory] {line}")
+    print("Global statistics collected and private noise scales initialized.")
+    print("Exact private coefficients and thresholds are not printed by this script.")
 
-    for byq in os.listdir(p1):
-        p2 = os.path.join(p1, byq)
-        if not os.path.isdir(p2):
+    rng = np.random.default_rng()
+
+    for feeder in os.listdir(INPUT_ROOT):
+        feeder_path = os.path.join(INPUT_ROOT, feeder)
+        if not os.path.isdir(feeder_path):
             continue
-        print(f"  [Secondary directory] {byq}")
 
-        out_dir = os.path.join(output_root, line, byq)
-        os.makedirs(out_dir, exist_ok=True)
-
-        for file in os.listdir(p2):
-            if not file.endswith(".csv"):
+        for transformer in os.listdir(feeder_path):
+            transformer_path = os.path.join(feeder_path, transformer)
+            if not os.path.isdir(transformer_path):
                 continue
 
-            processed += 1
-            print(f"    [Processed {processed}/{total_files}] files:{file}")
+            out_dir = os.path.join(OUTPUT_ROOT, feeder, transformer)
+            process_transformer_folder(transformer_path, out_dir, sigmas, config, rng)
 
-            file_type = classify_column(file)
+    print("All files have been processed.")
 
-            df = pd.read_csv(os.path.join(p2, file), encoding="utf-8-sig")
-            df = apply_noise(df, file_type)
 
-            df.to_csv(os.path.join(out_dir, file),
-                      index=False,
-                      encoding="utf-8-sig")
-
-print("\n========== All files have been processed. ==========")
+if __name__ == "__main__":
+    main()

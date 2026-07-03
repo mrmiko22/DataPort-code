@@ -1,202 +1,222 @@
+import json
 import os
-import pandas as pd
 import warnings
 from itertools import count, product
 
-warnings.filterwarnings('ignore')
+import pandas as pd
 
-# ==================== Deployment ====================
-input_folder = r"0Replace with the original data location"
-output_root = r"1Data extraction"
-# ================================================
+warnings.filterwarnings("ignore")
 
-os.makedirs(output_root, exist_ok=True)
 
-# ========= Indicator =========
-metric_cols = [
-    'AXDL', 'BXDL', 'CXDL',
-    'AXDY', 'BXDY', 'CXDY',
-    'YGGL', 'AXYGGL', 'BXYGGL', 'CXYGGL',
-    'WGGL', 'AXWGGL', 'BXWGGL', 'CXWGGL'
+OUTPUT_ROOT = r"1Data extraction"
+
+INTERNAL_METRIC_ORDER = [
+    "AXDL", "BXDL", "CXDL",
+    "AXDY", "BXDY", "CXDY",
+    "YGGL", "AXYGGL", "BXYGGL", "CXYGGL",
+    "WGGL", "AXWGGL", "BXWGGL", "CXWGGL",
 ]
 
-required_cols = ['BYQJH', 'SJSJ'] + metric_cols
-
-# ========= Desensitization =========
-line_map = {}
-line_counter = count(1)
-byq_map = {}
-BYQ_ALPHABETS = [f"{i[0]}" for i in product('ABCDEFGHIJKLMNOPQRSTUVWXYZ', repeat=1)]
-
-all_generated_csvs = []
+BYQ_ALPHABETS = [item[0] for item in product("ABCDEFGHIJKLMNOPQRSTUVWXYZ", repeat=1)]
 
 
-def parse_sjsj(time_str):
+def require_private_text(env_name):
+    value = os.getenv(env_name)
+    if not value:
+        raise RuntimeError(
+            f"Private configuration {env_name} is required. "
+            "Set it outside the public repository before running this script."
+        )
+    return value
+
+
+def load_private_config():
+    metric_map = json.loads(require_private_text("TYMPSSMD_RAW_METRIC_COLUMN_MAP"))
+    missing_keys = [key for key in INTERNAL_METRIC_ORDER if key not in metric_map]
+    if missing_keys:
+        raise RuntimeError(
+            "The private raw metric mapping is incomplete for internal keys: "
+            + ", ".join(missing_keys)
+        )
+
+    return {
+        "input_folder": require_private_text("TYMPSSMD_RAW_INPUT_DIR"),
+        "time_column": require_private_text("TYMPSSMD_RAW_TIME_COLUMN"),
+        "transformer_column": require_private_text("TYMPSSMD_RAW_TRANSFORMER_COLUMN"),
+        "metric_map": metric_map,
+    }
+
+
+def parse_timestamp(time_value):
     try:
-        time_str = str(time_str).strip()
-        if not time_str or time_str.lower() == 'nan':
+        time_str = str(time_value).strip()
+        if not time_str or time_str.lower() == "nan":
             return pd.NaT
-        parts = time_str.replace('-', '/').split(' ')
+        normalized = time_str.replace("-", "/")
+        parts = normalized.split(" ")
         if len(parts) != 2:
             return pd.NaT
         date_part, time_part = parts
         try:
-            y, m, d = date_part.split('/')
-            y, m, d = y, m.zfill(2), d.zfill(2)
-            time_dt_str = f"{y}-{m}-{d} {time_part}"
+            year, month, day = date_part.split("/")
+            time_dt_str = f"{year}-{month.zfill(2)}-{day.zfill(2)} {time_part}"
         except ValueError:
-            time_dt_str = time_str.replace('/', '-')
-        return pd.to_datetime(time_dt_str, format='%Y-%m-%d %H:%M:%S', errors='coerce')
-    except:
+            time_dt_str = time_str.replace("/", "-")
+        return pd.to_datetime(
+            time_dt_str,
+            format="%Y-%m-%d %H:%M:%S",
+            errors="coerce",
+        )
+    except Exception:
         return pd.NaT
 
 
-def get_daily_96_points_template(date):
-    start = pd.to_datetime(f'{date} 00:00:00')
-    end = pd.to_datetime(f'{date} 23:45:00')
-    full_day_series = pd.date_range(start=start, end=end, freq='15min')
-    template_df = pd.DataFrame(full_day_series, columns=['SJSJ_Full'])
-    return template_df
+def get_daily_96_points_template(date_value):
+    start = pd.to_datetime(f"{date_value} 00:00:00")
+    end = pd.to_datetime(f"{date_value} 23:45:00")
+    full_day_series = pd.date_range(start=start, end=end, freq="15min")
+    return pd.DataFrame(full_day_series, columns=["timestamp_full"])
 
 
-# ========= Iterate through each route CSV file =========
-for filename in os.listdir(input_folder):
-    if not filename.lower().endswith('.csv'):
-        continue
+def get_transformer_code(counter_value):
+    if counter_value >= len(BYQ_ALPHABETS):
+        return f"Trans_{counter_value - len(BYQ_ALPHABETS) + 1}"
+    return BYQ_ALPHABETS[counter_value]
 
-    # --- 1. Line desensitization ---
-    if filename not in line_map:
-        line_map[filename] = str(next(line_counter))
-    line_code = line_map[filename]
 
-    line_output_folder = os.path.join(output_root, line_code)
-    os.makedirs(line_output_folder, exist_ok=True)
+def post_process_csv(file_path):
+    try:
+        df = pd.read_csv(file_path, encoding="utf-8-sig", header=0)
+        if not df.empty and df.columns[0] == "transformer_code":
+            df = df.iloc[:, 1:]
+            df.to_csv(file_path, mode="w", index=False, header=True, encoding="utf-8-sig")
+            return True
+    except Exception as exc:
+        print(f"Post-processing failed for {file_path}: {exc}")
+    return False
 
-    file_path = os.path.join(input_folder, filename)
-    print(f"\nProcessing line files: {filename} -> Route Code {line_code}")
+
+def process_raw_file(file_path, feeder_code, config, generated_csvs):
+    raw_time_col = config["time_column"]
+    raw_transformer_col = config["transformer_column"]
+    metric_map = config["metric_map"]
 
     try:
-        df = pd.read_csv(file_path, encoding='utf-8', dtype=str, on_bad_lines='skip', low_memory=False)
-        print(f"  Number of rows in the original data: {len(df)}")
-    except Exception as e:
-        print(f"  Read operation failed: {e}")
-        continue
+        df = pd.read_csv(
+            file_path,
+            encoding="utf-8",
+            dtype=str,
+            on_bad_lines="skip",
+            low_memory=False,
+        )
+    except Exception as exc:
+        print(f"Read operation failed for one raw feeder file: {exc}")
+        return
 
-    missing_cols = [col for col in required_cols if col not in df.columns]
+    required_raw_cols = [raw_transformer_col, raw_time_col] + [
+        metric_map[key] for key in INTERNAL_METRIC_ORDER
+    ]
+    missing_cols = [col for col in required_raw_cols if col not in df.columns]
     if missing_cols:
-        print(f"  Skip: Missing column {missing_cols}")
-        continue
+        print("Skip one raw feeder file because required private columns are missing.")
+        return
 
-    # ========= 2. Analysis of SJSJ =========
-    df['SJSJ_parsed'] = df['SJSJ'].apply(parse_sjsj)
-    df = df[df['SJSJ_parsed'].notna()].copy()
+    df["parsed_timestamp"] = df[raw_time_col].apply(parse_timestamp)
+    df = df[df["parsed_timestamp"].notna()].copy()
     if df.empty:
-        print(f"  Skip: All SJSJ parsing failed")
-        continue
+        print("Skip one raw feeder file because all timestamps failed to parse.")
+        return
 
-    df['SJSJ'] = df['SJSJ_parsed']
-    df = df.drop(columns=['SJSJ_parsed'])
-
-    # ========= 3. Deduplication =========
-    df['__hash'] = df.apply(lambda row: (row['SJSJ'],) + tuple(row[col] for col in metric_cols), axis=1)
-    df = df.drop_duplicates(subset=['__hash'], keep='first')
-    df = df.drop(columns=['__hash'])
-
+    df[raw_transformer_col] = df[raw_transformer_col].astype(str).str.strip()
+    df = df[df[raw_transformer_col] != ""]
     if df.empty:
-        print(f"  Skip: Empty after deduplication")
-        continue
+        print("Skip one raw feeder file because transformer identifiers are empty.")
+        return
 
-    # ========= 4. Add date string =========
-    df['date_str'] = df['SJSJ'].dt.strftime('%Y-%m-%d')
+    hash_cols = ["parsed_timestamp"] + [metric_map[key] for key in INTERNAL_METRIC_ORDER]
+    df = df.drop_duplicates(subset=hash_cols, keep="first")
+    df["date_str"] = df["parsed_timestamp"].dt.strftime("%Y-%m-%d")
 
-    # ========= 5. Check if BYQJH is empty and group =========
-    df['BYQJH'] = df['BYQJH'].astype(str).str.strip()
-    df = df[df['BYQJH'] != '']
-    byqjh_groups = df.groupby('BYQJH')
+    feeder_output_folder = os.path.join(OUTPUT_ROOT, feeder_code)
+    os.makedirs(feeder_output_folder, exist_ok=True)
 
-    # --- 6. Transformer Desensitization and Batch Writing ---
-    byq_code_counter = 0
-    line_byq_map = {}
+    transformer_code_counter = 0
+    transformer_map = {}
 
-    for byqjh_orig, group in byqjh_groups:
+    for raw_transformer_id, group in df.groupby(raw_transformer_col):
+        if raw_transformer_id not in transformer_map:
+            transformer_map[raw_transformer_id] = get_transformer_code(transformer_code_counter)
+            transformer_code_counter += 1
 
-        # --- Transformer Desensitization ---
-        if byqjh_orig not in line_byq_map:
-            if byq_code_counter >= len(BYQ_ALPHABETS):
-                byq_code = f"Z{byq_code_counter - len(BYQ_ALPHABETS) + 1}"
-            else:
-                byq_code = BYQ_ALPHABETS[byq_code_counter]
-            line_byq_map[byqjh_orig] = byq_code
-            byq_code_counter += 1
+        transformer_code = transformer_map[raw_transformer_id]
+        transformer_folder = os.path.join(feeder_output_folder, transformer_code)
+        os.makedirs(transformer_folder, exist_ok=True)
 
-        byq_code = line_byq_map[byqjh_orig]
-
-        byq_folder = os.path.join(line_output_folder, byq_code)
-        os.makedirs(byq_folder, exist_ok=True)
-
-        # Processing logic grouped by day
-        for date, day_group in group.groupby(group['SJSJ'].dt.date):
-            date_str = day_group['date_str'].iloc[0]
+        for date_value, day_group in group.groupby(group["parsed_timestamp"].dt.date):
+            date_str = day_group["date_str"].iloc[0]
             template_df = get_daily_96_points_template(date_str)
 
-            for metric in metric_cols:
-                metric_df = day_group[['SJSJ', metric]].rename(columns={metric: 'Metric_Value'}).copy()
-                metric_df['Metric_Value'] = pd.to_numeric(metric_df['Metric_Value'], errors='coerce')
+            for internal_metric in INTERNAL_METRIC_ORDER:
+                raw_metric_col = metric_map[internal_metric]
+                metric_df = day_group[["parsed_timestamp", raw_metric_col]].rename(
+                    columns={raw_metric_col: "metric_value"}
+                )
+                metric_df["metric_value"] = pd.to_numeric(
+                    metric_df["metric_value"],
+                    errors="coerce",
+                )
                 merged_df = template_df.merge(
                     metric_df,
-                    left_on='SJSJ_Full',
-                    right_on='SJSJ',
-                    how='left'
-                ).drop(columns=['SJSJ'])
+                    left_on="timestamp_full",
+                    right_on="parsed_timestamp",
+                    how="left",
+                ).drop(columns=["parsed_timestamp"])
 
-                values = merged_df['Metric_Value'].fillna('').tolist()
-
+                values = merged_df["metric_value"].fillna("").tolist()
                 if len(values) != 96:
                     continue
 
-                row = [byq_code, date_str] + values
-                csv_file = os.path.join(byq_folder, f"{metric}.csv")
-                all_generated_csvs.append(csv_file)
+                csv_file = os.path.join(transformer_folder, f"{internal_metric}.csv")
+                generated_csvs.append(csv_file)
                 write_header = not os.path.exists(csv_file)
-
-                header_names = ['BYQJH_Code', 'Date'] + [f"Value_{i + 1}" for i in range(96)]
+                row = [transformer_code, date_str] + values
+                header_names = ["transformer_code", "Date"] + [
+                    f"Value_{idx + 1}" for idx in range(96)
+                ]
                 row_df = pd.DataFrame([row], columns=header_names)
-                row_df.to_csv(csv_file, mode='a', index=False, header=write_header, encoding='utf-8-sig')
-
-        print(f"  Transformers generated: {byqjh_orig} -> Code Name {byq_code}")
-
-    print(f"Route File {filename} Processing complete!")
-
-
-# --- 7. Post-processing ---
-def post_process_csv(file_path):
-    try:
-        df = pd.read_csv(file_path, encoding='utf-8-sig', header=0)
-        if not df.empty and df.columns[0] == 'BYQJH_Code':
-            df = df.iloc[:, 1:]
-            df.to_csv(file_path, mode='w', index=False, header=True, encoding='utf-8-sig')
-            return True
-        else:
-            return False
-    except Exception as e:
-        print(f"  Post-processing files {file_path} Failure: {e}")
-        return False
+                row_df.to_csv(
+                    csv_file,
+                    mode="a",
+                    index=False,
+                    header=write_header,
+                    encoding="utf-8-sig",
+                )
 
 
-print("\n" + "=" * 50)
+def main():
+    config = load_private_config()
+    input_folder = config["input_folder"]
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
-print("=" * 50)
-print(f"All route files have been processed. Post-processing of {len(all_generated_csvs)} files is now beginning...")
+    generated_csvs = []
+    feeder_counter = count(1)
 
-unique_csvs = list(set(all_generated_csvs))
-post_processed_count = 0
+    for filename in os.listdir(input_folder):
+        if not filename.lower().endswith(".csv"):
+            continue
+        feeder_code = str(next(feeder_counter))
+        process_raw_file(
+            os.path.join(input_folder, filename),
+            feeder_code,
+            config,
+            generated_csvs,
+        )
 
-for i, csv_file in enumerate(unique_csvs):
-    if post_process_csv(csv_file):
-        post_processed_count += 1
-    if (i + 1) % 100 == 0:
-        print(f"  Post-processing completed for {i + 1} out of {len(unique_csvs)} files....")
+    for csv_file in set(generated_csvs):
+        post_process_csv(csv_file)
 
-print(f"Post-processing complete! A total of {post_processed_count} files have been modified.")
-print("=" * 50)
-print(f"Final Results Directory: {output_root}")
+    print(f"Data extraction complete. Output directory: {OUTPUT_ROOT}")
+
+
+if __name__ == "__main__":
+    main()

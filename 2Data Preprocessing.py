@@ -1,129 +1,200 @@
 import os
-import pandas as pd
-import numpy as np
 import warnings
 
-warnings.filterwarnings('ignore')
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
 
 
-# ==============================================
-# Logarithmic function
-# ==============================================
+INPUT_ROOT = r"1Data extraction"
+OUTPUT_ROOT = r"2Data Preprocessing"
+
+VALUE_PREFIX = "Value_"
+MISSING_TOKENS = [" ", "", "NULL", "null", "None", "none", "NaN", "nan"]
+
+
 def log(msg):
     print(f"[INFO] {msg}")
 
 
-# ==============================================
-# Core Logic of Data Preprocessing
-# ==============================================
-def preprocess_dataframe(df):
+def require_private_float(env_name):
+    value = os.getenv(env_name)
+    if value is None:
+        raise RuntimeError(
+            f"Private configuration {env_name} is required. "
+            "Set it outside the public repository before running this script."
+        )
+    return float(value)
+
+
+def require_private_int(env_name):
+    value = os.getenv(env_name)
+    if value is None:
+        raise RuntimeError(
+            f"Private configuration {env_name} is required. "
+            "Set it outside the public repository before running this script."
+        )
+    return int(value)
+
+
+def require_private_bool(env_name):
+    value = os.getenv(env_name)
+    if value is None:
+        raise RuntimeError(
+            f"Private configuration {env_name} is required. "
+            "Set it outside the public repository before running this script."
+        )
+    return value.strip().lower() in {"1", "true", "yes", "y"}
+
+
+def load_private_config():
+    return {
+        "daily_missing_ratio_threshold": require_private_float(
+            "TYMPSSMD_DAILY_MISSING_RATIO_THRESHOLD"
+        ),
+        "long_gap_min_points": require_private_int(
+            "TYMPSSMD_LONG_GAP_MIN_POINTS"
+        ),
+        "zero_as_missing": require_private_bool(
+            "TYMPSSMD_ZERO_AS_MISSING"
+        ),
+    }
+
+
+def get_value_columns(df):
+    return [col for col in df.columns if str(col).startswith(VALUE_PREFIX)]
+
+
+def normalize_missing_values(df, value_cols, zero_as_missing):
+    df = df.replace(MISSING_TOKENS, np.nan)
+    for col in value_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    if zero_as_missing:
+        df[value_cols] = df[value_cols].replace(0, np.nan)
+    return df
+
+
+def contiguous_nan_runs(mask):
+    runs = []
+    start = None
+    for idx, is_missing in enumerate(mask):
+        if is_missing and start is None:
+            start = idx
+        elif not is_missing and start is not None:
+            runs.append((start, idx))
+            start = None
+    if start is not None:
+        runs.append((start, len(mask)))
+    return runs
+
+
+def adjacent_day_profile_fill(df, value_cols, original_missing_mask, long_gap_min_points):
+    repaired = df.copy()
+    values = repaired[value_cols].to_numpy(dtype=float)
+    missing_mask = repaired[value_cols].isna().to_numpy()
+    original_mask = original_missing_mask[value_cols].to_numpy()
+
+    for row_idx in range(values.shape[0]):
+        for start, end in contiguous_nan_runs(original_mask[row_idx]):
+            if end - start < long_gap_min_points:
+                continue
+
+            target_cols = list(range(start, end))
+            candidates = []
+            if row_idx > 0:
+                candidates.append(values[row_idx - 1, target_cols])
+            if row_idx + 1 < values.shape[0]:
+                candidates.append(values[row_idx + 1, target_cols])
+            if not candidates:
+                continue
+
+            profile = np.nanmean(np.vstack(candidates), axis=0)
+            for offset, col_idx in enumerate(target_cols):
+                if missing_mask[row_idx, col_idx] and not np.isnan(profile[offset]):
+                    values[row_idx, col_idx] = profile[offset]
+                    missing_mask[row_idx, col_idx] = False
+
+    repaired[value_cols] = values
+    return repaired
+
+
+def repair_missing_values(df, value_cols, config):
+    original_missing_mask = df[value_cols].isna()
+
+    work = df.copy()
+    numeric = work[value_cols].copy()
+    original_cols = list(numeric.columns)
+    numeric.columns = range(len(original_cols))
+
+    log("Perform shape preserving intraday interpolation")
+    try:
+        numeric = numeric.interpolate(method="pchip", axis=1, limit_area="inside")
+    except Exception as exc:
+        log(f"PCHIP interpolation failed; falling back to linear interpolation: {exc}")
+        numeric = numeric.interpolate(method="linear", axis=1, limit_area="inside")
+
+    log("Fill boundary gaps within each retained day")
+    numeric = numeric.ffill(axis=1).bfill(axis=1)
+
+    numeric.columns = original_cols
+    work[value_cols] = numeric
+
+    log("Apply adjacent day historical profile imputation for longer contiguous gaps")
+    work = adjacent_day_profile_fill(
+        work,
+        value_cols,
+        original_missing_mask,
+        config["long_gap_min_points"],
+    )
+
+    log("Apply inter day interpolation for remaining local gaps")
+    work[value_cols] = work[value_cols].interpolate(
+        method="linear",
+        axis=0,
+        limit_direction="both",
+    )
+
+    return work
+
+
+def preprocess_dataframe(df, config):
     log("Commencing preprocessing of this file")
 
-    df = df.replace([" ", "", "NULL", "null", "None"], np.nan)
+    value_cols = get_value_columns(df)
+    if not value_cols:
+        raise ValueError("No Value_* columns were found in the input file.")
 
-    temp = df.replace(0, np.nan)
+    df = normalize_missing_values(df, value_cols, config["zero_as_missing"])
 
-    # ---------------------------
-    # 1) Remove rows where the proportion of missing values exceeds x
-    # ---------------------------
-    log("Detect rows where the number of 0s or NaNs exceeds x")
-    missing_ratio = temp.isna().mean(axis=1)
-    df = df.loc[missing_ratio <= x].copy()
+    log("Remove days whose missing ratio exceeds the private threshold")
+    missing_ratio = df[value_cols].isna().mean(axis=1)
+    df = df.loc[missing_ratio <= config["daily_missing_ratio_threshold"]].copy()
 
-    df = df.replace(0, np.nan)
+    if df.empty:
+        return df
 
-    # ---------------------------
-    # 2) Interpolation + Completion Logic
-    # ---------------------------
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-
-    if len(numeric_cols) > 0:
-        log("Implementing a multi-level backfilling strategy (Optimized for Power Systems)...")
-
-        # =========================================================
-        # CRITICAL UPDATE: Fix PCHIP column name error & Prevent tail divergence
-        # =========================================================
-
-        # 1. Create a subset and rename columns to integers (0, 1, 2...)
-        # This is necessary because PCHIP requires numeric indices to calculate distances.
-        df_subset = df[numeric_cols].copy()
-        original_cols = df_subset.columns
-        df_subset.columns = range(len(df_subset.columns))
-
-        # 2. Level 1: Lateral PCHIP Interpolation (Inside Area Only)
-        # limit_area='inside' prevents the "tail divergence" issue (e.g., -54.701)
-        # by ensuring we only interpolate between existing points, not extrapolate edges.
-        log("1. Perform lateral PCHIP conformal interpolation (Inside area only)")
-        try:
-            df_subset = df_subset.interpolate(method='pchip', axis=1, limit_area='inside')
-        except Exception as e:
-            log(f"PCHIP failed (fallback to Linear): {e}")
-            df_subset = df_subset.interpolate(method='linear', axis=1, limit_area='inside')
-
-        # 3. Handle Edge Cases (Rows starting or ending with NaNs)
-        # Use flat filling (Forward/Backward Fill) for the tails to be safe.
-        df_subset = df_subset.ffill(axis=1).bfill(axis=1)
-
-        # 4. Restore original column names and update dataframe
-        df_subset.columns = original_cols
-        df[numeric_cols] = df_subset
-
-        # ---------------------------------------------------------
-
-        # 5. Level 2: Vertical Linear Interpolation
-        # Uses trends from adjacent days to fill remaining gaps.
-        log("2. Perform vertical linear interpolation")
-        df[numeric_cols] = df[numeric_cols].interpolate(method='linear', axis=0, limit_direction='both')
-
-        # 6. Level 3: Full-range Boundary Filling
-        log("3. Perform full-range boundary filling")
-        df[numeric_cols] = df[numeric_cols].ffill(axis=0).bfill(axis=0)
-
-        # 7. Level 4: Global Median Fallback
-        if df[numeric_cols].isna().any().any():
-            log("Detected persistent missing values; imputed using the global median.")
-            for col in numeric_cols:
-                if df[col].isna().any():
-                    median_val = df[col].median()
-                    fill_val = 0 if pd.isna(median_val) else median_val
-                    df[col] = df[col].fillna(fill_val)
-
-    # ---------------------------
-    # 3) Type inference avoids FutureWarning
-    # ---------------------------
+    df = repair_missing_values(df, value_cols, config)
     df = df.infer_objects(copy=False)
-
-    # ---------------------------
-    # 4) Final format: All values retained to 4 decimal places
-    # ---------------------------
-    if len(numeric_cols) > 0:
-        log("All values are formatted as floats, retaining four decimal places.")
-        df[numeric_cols] = df[numeric_cols].astype(float).round(4)
+    df[value_cols] = df[value_cols].astype(float).round(4)
 
     return df
 
 
-# ==============================================
-# Processing a single CSV file
-# ==============================================
-def process_single_file(in_path, out_path):
-    log(f"Read CSV：{in_path}")
+def process_single_file(in_path, out_path, config):
+    log(f"Read CSV: {in_path}")
     df = pd.read_csv(in_path, encoding="utf-8", low_memory=False)
-
-    df = preprocess_dataframe(df)
-
+    df = preprocess_dataframe(df, config)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    log(f"Write CSV：{out_path}")
+    log(f"Write CSV: {out_path}")
     df.to_csv(out_path, index=False, encoding="utf-8-sig")
 
 
-# ==============================================
-# Main
-# ==============================================
 def process_all_files(input_root, output_root):
-    log("Begin batch processing all files")
+    config = load_private_config()
+    log("Begin batch preprocessing")
 
-    for dirpath, dirnames, filenames in os.walk(input_root):
+    for dirpath, _, filenames in os.walk(input_root):
         for filename in filenames:
             if not filename.lower().endswith(".csv"):
                 continue
@@ -134,21 +205,15 @@ def process_all_files(input_root, output_root):
             out_path = os.path.join(out_dir, filename)
 
             log("=" * 80)
-            log(f"Commencing processing of the document：{filename}")
+            log(f"Processing file: {filename}")
             try:
-                process_single_file(in_path, out_path)
-                log(f"File processing successful：{filename}")
-            except Exception as e:
-                log(f"An error occurred while processing the file {filename}:{e}")
+                process_single_file(in_path, out_path, config)
+                log(f"File processed successfully: {filename}")
+            except Exception as exc:
+                log(f"An error occurred while processing {filename}: {exc}")
 
     log("All documents have been processed.")
 
 
-# ==============================================
-# Entrance
-# ==============================================
 if __name__ == "__main__":
-    input_root = r"1Data extraction"
-    output_root = r"2Data Preprocessing"
-
-    process_all_files(input_root, output_root)
+    process_all_files(INPUT_ROOT, OUTPUT_ROOT)
